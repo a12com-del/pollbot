@@ -1,6 +1,9 @@
 import tempfile
 import unittest
-from dataclasses import replace
+import json
+import sqlite3
+from contextlib import closing
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,10 +48,47 @@ class SettingsTests(unittest.TestCase):
             {"interval_minutes": 10081},
             {"cron_expression": "0 12 * * 1,4", "interval_minutes": 2},
             {"cron_expression": "0 12 31 2 *"},
+            {"name": " "}, {"name": "a" * 61}, {"name": "One\nTwo"},
+            {"destination_label": "a" * 61}, {"is_channel": True, "anonymous": False},
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 replace(Settings(), **values).validate()
+
+    def test_legacy_single_poll_migrates_once_without_losing_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.db"
+            legacy = replace(Settings(), chat_id=-100123, enabled=True, cron_expression="0 12 * * 1,4")
+            values = asdict(legacy)
+            for field in ("name", "destination_label", "is_channel"):
+                values.pop(field)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+                connection.execute("INSERT INTO settings VALUES (1, ?)", (json.dumps(values),))
+            store = SettingsStore(path)
+            self.assertEqual(store.list_polls(), {1: legacy})
+            changed = replace(legacy, name="Morning class", destination_label="Main group")
+            store.save(changed)
+            self.assertEqual(SettingsStore(path).load(), changed)
+
+    def test_multiple_polls_are_independent_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.db"
+            store = SettingsStore(path)
+            second = replace(Settings(), name="Evening class", destination_label="Evening group", chat_id=-100456, hour=18)
+            poll_id = store.create(second)
+            store.save(replace(Settings(), name="Morning class", hour=9))
+            reloaded = SettingsStore(path)
+            self.assertEqual(len(reloaded.list_polls()), 2)
+            self.assertEqual(reloaded.load(poll_id), second)
+            self.assertEqual(reloaded.load().hour, 9)
+            reloaded.delete(poll_id)
+            with self.assertRaises(ValueError):
+                reloaded.load(poll_id)
+            with self.assertRaises(ValueError):
+                reloaded.save(second, poll_id)
+            reloaded.delete(1)
+            self.assertEqual(SettingsStore(path).list_polls(), {})
 
     def test_cron_settings_survive_reload(self):
         with tempfile.TemporaryDirectory() as directory:

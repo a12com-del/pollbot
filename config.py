@@ -45,8 +45,17 @@ class Settings:
     enabled: bool = False
     interval_minutes: int | None = None
     cron_expression: str | None = None
+    name: str = "Poll 1"
+    destination_label: str = ""
+    is_channel: bool = False
 
     def validate(self) -> None:
+        if not self.name.strip() or len(self.name) > 60 or "\n" in self.name:
+            raise ValueError("Poll name must contain 1 to 60 characters on one line.")
+        if len(self.destination_label) > 60 or "\n" in self.destination_label:
+            raise ValueError("Destination label must contain at most 60 characters on one line.")
+        if self.is_channel and not self.anonymous:
+            raise ValueError("Channel polls must be anonymous.")
         try:
             ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError) as error:
@@ -101,24 +110,50 @@ class SettingsStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path)) as connection, connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+            connection.execute("BEGIN IMMEDIATE")
+            initialized = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'polls'").fetchone()
+            connection.execute("CREATE TABLE IF NOT EXISTS polls (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)")
+            if initialized is None:
+                legacy = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").fetchone()
+                row = connection.execute("SELECT data FROM settings WHERE id = 1").fetchone() if legacy else None
+                settings = self.decode(row[0]) if row else Settings()
+                connection.execute("INSERT INTO polls (id, data) VALUES (1, ?)", (json.dumps(asdict(settings)),))
 
-    def load(self) -> Settings:
-        with closing(sqlite3.connect(self.path)) as connection, connection:
-            row = connection.execute("SELECT data FROM settings WHERE id = 1").fetchone()
-        if row is None:
-            return Settings()
-        values = json.loads(row[0])
+    @staticmethod
+    def decode(data: str) -> Settings:
+        values = json.loads(data)
         values["options"] = tuple(values["options"])
         values["days"] = tuple(values["days"])
         settings = Settings(**values)
         settings.validate()
         return settings
 
-    def save(self, settings: Settings) -> None:
+    def load(self, poll_id: int = 1) -> Settings:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            row = connection.execute("SELECT data FROM polls WHERE id = ?", (poll_id,)).fetchone()
+        if row is None:
+            raise ValueError("This poll no longer exists.")
+        return self.decode(row[0])
+
+    def list_polls(self) -> dict[int, Settings]:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            rows = connection.execute("SELECT id, data FROM polls ORDER BY id").fetchall()
+        return {poll_id: self.decode(data) for poll_id, data in rows}
+
+    def save(self, settings: Settings, poll_id: int = 1) -> None:
         settings.validate()
         with closing(sqlite3.connect(self.path)) as connection, connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO settings (id, data) VALUES (1, ?)",
-                (json.dumps(asdict(settings)),),
-            )
+            result = connection.execute("UPDATE polls SET data = ? WHERE id = ?", (json.dumps(asdict(settings)), poll_id))
+            if result.rowcount == 0:
+                raise ValueError("This poll no longer exists.")
+
+    def create(self, settings: Settings) -> int:
+        settings.validate()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            result = connection.execute("INSERT INTO polls (data) VALUES (?)", (json.dumps(asdict(settings)),))
+            assert result.lastrowid is not None
+            return int(result.lastrowid)
+
+    def delete(self, poll_id: int) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DELETE FROM polls WHERE id = ?", (poll_id,))

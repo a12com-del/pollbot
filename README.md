@@ -1,8 +1,9 @@
 # Scheduled Telegram Poll Bot
 
 A Python bot with a private Telegram admin panel and persistent settings.
-One configured poll is posted to one destination using a weekday/time or cron
-schedule. Existing minute-based interval schedules are also supported.
+Manage multiple named polls, each with its own destination, question, answers,
+time zone, and weekday/time or cron schedule. Existing minute-based interval
+schedules are also supported. Destinations are shown by editable labels.
 
 ## Container Setup (Podman or Docker)
 
@@ -285,7 +286,8 @@ Alternatively, install `python-telegram-bot[job-queue]>=22,<23` and
    ```
 
 5. Open a private conversation with the bot and send `/start` or `/admin`.
-6. In the target group, send `/chatid@YourBotUsername`. Enter that negative
+6. Select a poll in `/admin`, or choose **New poll** and name it. In the target
+   group, send `/chatid@YourBotUsername`. Enter that negative
    ID using **Destination** in the private panel. For a channel, make the bot
    an administrator with permission to post messages, then forward an original
    channel post to the bot privately. This selects the channel, verifies posting
@@ -302,10 +304,51 @@ private chats; `/chatid` also works in groups for those admins.
 
 ## Configuration
 
-The panel has buttons for question, answer options, schedule, time zone,
-destination, anonymous voting, multiple answers, enabling/disabling posting,
-preview, and immediate posting with confirmation. `/cancel` abandons an edit.
-Changes persist in `data/settings.db` and apply without restarting.
+`/admin` opens the poll list. Select a poll to manage its question, answer options,
+schedule, time zone, destination, anonymous voting, multiple answers, posting
+state, previews, and immediate sending. Each poll has its own settings and
+scheduled job. `/cancel` abandons an edit. Changes persist in `data/settings.db`
+and apply without restarting.
+
+### Multiple Polls and Destination Labels
+
+- Use **New poll** to add a disabled poll, then give it a name. **Name** renames
+   an existing poll. **All polls** returns to the list; long lists have pagination.
+- Use **Destination** to choose a labelled destination already used by another
+   poll, or **Enter chat ID** to register one. The bot looks up the Telegram group
+   or channel title automatically. **Edit label** sets a friendly label for that
+   poll's destination, such as `Main studio` or `Weekend class`.
+- You can also forward an original channel post while a poll is selected.
+   With several polls, select the intended poll first to avoid changing the wrong
+   destination. Channel polls remain anonymous.
+- Changing a destination disables that poll until you explicitly enable it.
+   A label change alone does not disable posting. Destination menus and poll
+   panels show labels instead of numeric chat IDs.
+- Configure **Schedule**, **Time zone**, and voting preferences independently
+   for each poll, use **Preview**, then **Enable**. Multiple polls can share a
+   destination or use different destinations and posting times.
+- **Send now...** and **Delete poll...** require confirmation and apply only to
+   the selected poll. Deleting a poll removes its future scheduled job, not polls
+   already posted to Telegram. All polls may be deleted; **New poll** remains
+   available in the empty list.
+
+Each poll posts to one destination. To send the same question to two destinations
+or on two separate schedules, create two poll configurations. Different admins
+can select and edit different polls without sharing a current selection.
+
+### Upgrading from a Single Poll
+
+Back up the active SQLite database before deploying this version. At first
+startup, the previous single-poll configuration automatically becomes **Poll 1**,
+preserving its question, answers, destination ID, schedule, time zone, and enabled
+state. The migration is transactional and runs only once. Assign a destination
+label through **Destination > Edit label** if the old poll has no saved title.
+
+Use the existing named volume when recreating the container, or rebuild the image
+and restart the Quadlet service. Do not start a second bot instance for migration.
+To roll back to an older single-poll version, restore the pre-upgrade database
+backup; old versions cannot manage the new multi-poll configuration. Open `/admin`
+again after upgrading, since buttons from the old panel do not identify a poll.
 
 The default schedule is **Monday and Thursday at 13:00**, with posting disabled.
 The default time zone is **UTC**; select your actual IANA time zone, such as
@@ -384,5 +427,6 @@ hour like the default 13:00.
 
 Tests cover persistence, validation, local date rendering, weekday mapping,
 admin authorization, preview/group destinations, voting settings, both schedule
-formats, standard cron semantics, and scheduler integration. They do not require
-a token and do not send real Telegram messages.
+formats, standard cron semantics, scheduler integration, multi-poll migration,
+independent jobs, poll management, and labelled destination selection. They do
+not require a token and do not send real Telegram messages.

@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from telegram import Chat
+from telegram.error import TelegramError
 
 from config import Settings, SettingsStore
 
@@ -22,6 +24,176 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.bot = module.PollBot(SettingsStore(Path(self.directory.name) / "settings.db"), {123})
+
+    def make_update(self, action: str = "", text: str = "", user_id: int = 123):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=user_id), effective_chat=SimpleNamespace(id=user_id, type="private"),
+            effective_message=SimpleNamespace(text=text, reply_text=AsyncMock()),
+            callback_query=SimpleNamespace(data=action, answer=AsyncMock(), edit_message_reply_markup=AsyncMock()),
+        )
+
+    def make_context(self, user_data=None):
+        queue = Mock()
+        queue.get_jobs_by_name.return_value = ()
+        return SimpleNamespace(
+            user_data=user_data if user_data is not None else {}, application=SimpleNamespace(job_queue=queue),
+            bot=SimpleNamespace(
+                send_poll=AsyncMock(), send_message=AsyncMock(),
+                get_chat=AsyncMock(return_value=Chat(-100789, "supergroup", title="Main studio")),
+            ),
+        )
+
+    def add_poll(self, **values):
+        settings = replace(Settings(), **values)
+        poll_id = self.bot.store.create(settings)
+        self.bot.polls[poll_id] = settings
+        return poll_id
+
+    def test_three_schedule_modes_create_independent_jobs(self):
+        application = module.Application.builder().token("123:offline-test-token").build()
+        self.bot.settings = replace(Settings(), enabled=True, chat_id=-100123, hour=9)
+        second = self.add_poll(name="Midday", enabled=True, chat_id=-100456, cron_expression="0 12 * * 1,4")
+        third = self.add_poll(name="Interval", enabled=True, chat_id=-100789, interval_minutes=2)
+        self.bot.reschedule(application)
+        jobs = application.job_queue.jobs()
+        self.assertEqual({job.name for job in jobs}, {"scheduled_poll:1", f"scheduled_poll:{second}", f"scheduled_poll:{third}"})
+        self.assertEqual({job.data for job in jobs}, {1, second, third})
+        other_job = application.job_queue.get_jobs_by_name(f"scheduled_poll:{second}")[0]
+        self.bot.save(replace(self.bot.settings, enabled=False), application)
+        self.assertEqual(application.job_queue.get_jobs_by_name("scheduled_poll:1"), ())
+        self.assertIs(application.job_queue.get_jobs_by_name(f"scheduled_poll:{second}")[0], other_job)
+
+    async def test_scheduled_sends_use_each_polls_question_and_destination(self):
+        self.bot.settings = replace(Settings(), enabled=True, chat_id=-100123, question="Morning?")
+        second = self.add_poll(name="Evening", enabled=True, chat_id=-100456, question="Evening?", options=("Join", "Skip"))
+        context = self.make_context()
+        context.job = SimpleNamespace(data=1)
+        await self.bot.scheduled_poll(context)
+        context.job.data = second
+        await self.bot.scheduled_poll(context)
+        calls = context.bot.send_poll.call_args_list
+        self.assertEqual([(call.kwargs["chat_id"], call.kwargs["question"]) for call in calls], [(-100123, "Morning?"), (-100456, "Evening?")])
+        self.assertEqual(calls[1].kwargs["options"], ("Join", "Skip"))
+        self.bot.store.delete(second)
+        self.bot.polls.pop(second)
+        await self.bot.scheduled_poll(context)
+        self.assertEqual(context.bot.send_poll.await_count, 2)
+
+    async def test_admin_edits_are_scoped_to_poll_and_user(self):
+        second = self.add_poll(name="Evening")
+        self.bot.admin_ids.add(456)
+        first_context = self.make_context()
+        second_context = self.make_context()
+        await self.bot.button(self.make_update("question:1"), first_context)
+        await self.bot.button(self.make_update(f"question:{second}", user_id=456), second_context)
+        await self.bot.text(self.make_update(text="First question?"), first_context)
+        await self.bot.text(self.make_update(text="Second question?", user_id=456), second_context)
+        self.assertEqual(self.bot.store.load(1).question, "First question?")
+        self.assertEqual(self.bot.store.load(second).question, "Second question?")
+        text, keyboard = self.bot.panel(second)
+        self.assertIn("Evening", text)
+        self.assertTrue(all(button.callback_data.endswith(f":{second}") or button.callback_data == "list:0" for row in keyboard.inline_keyboard for button in row))
+
+    async def test_create_and_confirm_delete_poll_through_panel(self):
+        context = self.make_context()
+        await self.bot.button(self.make_update("new:0"), context)
+        poll_id = context.user_data["poll_id"]
+        self.assertEqual(len(self.bot.polls), 2)
+        self.assertFalse(self.bot.polls[poll_id].enabled)
+        await self.bot.text(self.make_update(text="Evening class"), context)
+        self.assertEqual(self.bot.store.load(poll_id).name, "Evening class")
+        await self.bot.button(self.make_update(f"delete:{poll_id}"), context)
+        self.assertIn(poll_id, self.bot.polls)
+        await self.bot.button(self.make_update(f"confirm_delete:{poll_id}"), context)
+        self.assertNotIn(poll_id, self.bot.polls)
+        self.assertEqual(len(self.bot.store.list_polls()), 1)
+        await self.bot.button(self.make_update(f"enabled:{poll_id}"), context)
+        self.assertNotIn(poll_id, self.bot.polls)
+
+    async def test_named_destinations_can_be_reused(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, destination_label="Main studio", is_channel=True)
+        self.bot.store.save(self.bot.settings)
+        second = self.add_poll(name="Evening", anonymous=False)
+        context = self.make_context()
+        update = self.make_update(f"destination:{second}")
+        await self.bot.button(update, context)
+        keyboard = update.effective_message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "Main studio")
+        await self.bot.button(self.make_update(f"dest:{second}:1"), context)
+        settings = self.bot.store.load(second)
+        self.assertEqual((settings.chat_id, settings.destination_label), (-100123, "Main studio"))
+        self.assertTrue(settings.anonymous)
+        self.assertTrue(settings.is_channel)
+        self.assertFalse(settings.enabled)
+        with self.assertRaises(ValueError):
+            replace(settings, anonymous=False).validate()
+        self.assertNotIn("-100123", self.bot.panel(second)[0])
+
+    async def test_numeric_destination_gets_telegram_title_and_can_be_renamed(self):
+        second = self.add_poll(name="Evening")
+        context = self.make_context()
+        await self.bot.button(self.make_update(f"group:{second}"), context)
+        await self.bot.text(self.make_update(text="-100789"), context)
+        self.assertEqual(self.bot.store.load(second).destination_label, "Main studio")
+        await self.bot.button(self.make_update(f"destination_label:{second}"), context)
+        await self.bot.text(self.make_update(text="Dance group"), context)
+        self.assertEqual(self.bot.store.load(second).destination_label, "Dance group")
+
+    async def test_one_failed_poll_does_not_stop_another(self):
+        self.bot.settings = replace(Settings(), name="Morning", chat_id=-100123, enabled=True)
+        second = self.add_poll(name="Evening", chat_id=-100456, enabled=True)
+        context = self.make_context()
+        context.bot.send_poll.side_effect = [TelegramError("Test failure"), None]
+        context.job = SimpleNamespace(data=1)
+        await self.bot.scheduled_poll(context)
+        context.job.data = second
+        await self.bot.scheduled_poll(context)
+        self.assertEqual(context.bot.send_poll.await_count, 2)
+        self.assertIn("Morning", context.bot.send_message.call_args.args[1])
+
+    async def test_queued_poll_is_not_sent_after_disable_or_delete(self):
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                self.bot.settings = replace(Settings(), enabled=True, chat_id=-100123)
+                context = self.make_context()
+                context.job = SimpleNamespace(data=1)
+                await self.bot.send_lock.acquire()
+                pending = asyncio.create_task(self.bot.scheduled_poll(context))
+                await asyncio.sleep(0)
+                if deleted:
+                    self.bot.polls.pop(1)
+                else:
+                    self.bot.settings = replace(self.bot.settings, enabled=False)
+                self.bot.send_lock.release()
+                await pending
+                context.bot.send_poll.assert_not_called()
+                context.bot.send_message.assert_not_called()
+
+    async def test_preview_and_confirm_send_remain_bound_to_original_poll(self):
+        second = self.add_poll(name="Evening", chat_id=-100456, question="Evening?")
+        context = self.make_context({"poll_id": 1})
+        await self.bot.button(self.make_update(f"preview:{second}"), context)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["chat_id"], 123)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["question"], "Evening?")
+        context.user_data["poll_id"] = 1
+        await self.bot.button(self.make_update(f"confirm_send:{second}"), context)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["chat_id"], -100456)
+
+    async def test_unauthorized_callback_cannot_create_or_delete(self):
+        context = self.make_context()
+        for action in ("new:0", "confirm_delete:1", "enabled:1"):
+            await self.bot.button(self.make_update(action, user_id=456), context)
+        self.assertEqual(self.bot.store.list_polls(), {1: Settings()})
+
+    def test_poll_and_destination_lists_paginate(self):
+        for index in range(10):
+            self.add_poll(name=f"Poll {index + 2}", chat_id=-100000 - index, destination_label=f"Group {index + 1}")
+        text, keyboard = self.bot.overview()
+        self.assertIn("11 configured", text)
+        self.assertEqual(len(keyboard.inline_keyboard), 10)
+        self.assertEqual(keyboard.inline_keyboard[-2][0].callback_data, "list:1")
+        second_page = self.bot.overview(1)[1]
+        self.assertEqual(second_page.inline_keyboard[-2][0].callback_data, "list:0")
 
     def test_authorization_requires_admin_and_private_chat(self):
         for user_id, chat_type, expected in ((123, "private", True), (456, "private", False), (123, "supergroup", False)):
@@ -92,7 +264,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             Settings(), enabled=True, chat_id=-100123, timezone="Etc/GMT-4", cron_expression="0 12 * * 1,4",
         )
         self.bot.reschedule(application)
-        jobs = application.job_queue.get_jobs_by_name("scheduled_poll")
+        jobs = application.job_queue.get_jobs_by_name("scheduled_poll:1")
         self.assertEqual(len(jobs), 1)
         trigger = jobs[0].job.trigger
         now = datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc)
@@ -115,7 +287,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             Settings(), enabled=True, chat_id=-100123, timezone="Etc/GMT-4", interval_minutes=2,
         )
         self.bot.reschedule(application)
-        jobs = application.job_queue.get_jobs_by_name("scheduled_poll")
+        jobs = application.job_queue.get_jobs_by_name("scheduled_poll:1")
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].job.trigger.interval.total_seconds(), 120)
         text, _ = self.bot.panel()
@@ -169,7 +341,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(type="private"),
             effective_message=SimpleNamespace(forward_origin=origin, reply_text=AsyncMock()),
         )
-        context = SimpleNamespace(bot=SimpleNamespace(id=789, get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member"))))
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace(id=789, get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member"))))
         await self.bot.forwarded_channel(update, context)
         self.assertIsNone(self.bot.settings.chat_id)
 
@@ -177,7 +349,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         application = module.Application.builder().token("123:offline-test-token").build()
         self.bot.settings = replace(Settings(), enabled=True, chat_id=-100123, timezone="Europe/Warsaw")
         self.bot.reschedule(application)
-        jobs = application.job_queue.get_jobs_by_name("scheduled_poll")
+        jobs = application.job_queue.get_jobs_by_name("scheduled_poll:1")
         self.assertEqual(len(jobs), 1)
         self.assertEqual(str(jobs[0].job.trigger.timezone), "Europe/Warsaw")
 
