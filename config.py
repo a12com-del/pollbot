@@ -2,13 +2,33 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from string import Formatter
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from apscheduler.triggers.base import BaseTrigger
+from croniter import CroniterBadDateError, croniter
+
 
 DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+class CrontabTrigger(BaseTrigger):
+    def __init__(self, expression: str, timezone: str):
+        if len(expression) > 256 or len(expression.split()) != 5 or not croniter.is_valid(expression):
+            raise ValueError("Use five cron fields: minute hour day-of-month month day-of-week.")
+        self.expression = expression
+        self.timezone = ZoneInfo(timezone)
+
+    def get_next_fire_time(self, previous_fire_time: datetime | None, now: datetime) -> datetime | None:
+        start = previous_fire_time if previous_fire_time is not None else now - timedelta(microseconds=1)
+        try:
+            return croniter(
+                self.expression, start.astimezone(self.timezone), max_years_between_matches=50,
+            ).get_next(datetime)
+        except CroniterBadDateError:
+            return None
 
 
 @dataclass(frozen=True)
@@ -24,6 +44,7 @@ class Settings:
     multiple: bool = False
     enabled: bool = False
     interval_minutes: int | None = None
+    cron_expression: str | None = None
 
     def validate(self) -> None:
         try:
@@ -35,6 +56,12 @@ class Settings:
             type(self.interval_minutes) is not int or not 1 <= self.interval_minutes <= 10080
         ):
             raise ValueError("Interval must be 1 to 10080 whole minutes.")
+        if self.cron_expression is not None:
+            if self.interval_minutes is not None:
+                raise ValueError("Select either a cron schedule or an interval, not both.")
+            trigger = CrontabTrigger(self.cron_expression, self.timezone)
+            if trigger.get_next_fire_time(None, datetime.now(ZoneInfo(self.timezone))) is None:
+                raise ValueError("Cron schedule has no occurrence within the next 50 years.")
         if not self.days or any(day not in range(7) for day in self.days):
             raise ValueError("Select at least one valid weekday.")
         if not 2 <= len(self.options) <= 10:

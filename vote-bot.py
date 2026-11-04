@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["python-telegram-bot[job-queue]>=22,<23", "python-dotenv>=1,<2"]
+# dependencies = ["python-telegram-bot[job-queue]>=22,<23", "python-dotenv>=1,<2", "croniter>=6,<7"]
 # ///
 
 import asyncio
@@ -12,23 +12,23 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
 )
 
-from config import DAY_NAMES, Settings, SettingsStore
+from config import CrontabTrigger, DAY_NAMES, Settings, SettingsStore
 
 
 LOGGER = logging.getLogger(__name__)
 PROMPTS = {
     "question": "Send the question. Variables: {date}, {weekday}, {{day_of_week}}, {time}.",
     "options": "Send 2 to 10 answer options, one per line.",
-    "schedule": "Send weekdays and time (mon,thu 13:00), or an interval (every 2 minutes).",
+    "schedule": "Send weekdays and time (mon tue wed, 14-31), or cron: 0 12 * * 1,4. Interval schedules (every 2 minutes) also work.",
     "timezone": "Send an IANA time zone, for example: Europe/Warsaw",
-    "group": "Send the destination group ID (a negative number). Use /chatid in the group to get it.",
+    "group": "Send the destination chat ID (a negative number), or forward a channel post here. Use /chatid in a group to get its ID.",
 }
 
 
@@ -38,30 +38,35 @@ def edit_setting(settings: Settings, field: str, value: str) -> Settings:
     elif field == "options":
         updated = replace(settings, options=tuple(option.strip() for option in value.splitlines()))
     elif field == "schedule":
+        if value.strip().lower().startswith("cron:"):
+            expression = " ".join(value.strip()[5:].split())
+            updated = replace(settings, cron_expression=expression, interval_minutes=None)
+            updated.validate()
+            return updated
         parts = value.lower().split()
         if len(parts) == 3 and parts[0] == "every" and parts[2] in {"minute", "minutes"}:
             try:
-                updated = replace(settings, interval_minutes=int(parts[1]))
+                updated = replace(settings, interval_minutes=int(parts[1]), cron_expression=None)
             except ValueError as error:
                 raise ValueError("Use an interval such as: every 2 minutes") from error
             updated.validate()
             return updated
         try:
-            weekdays, clock = value.lower().split()
-            days = tuple(sorted({DAY_NAMES.index(day.strip()) for day in weekdays.split(",")}))
-            hour, minute = map(int, clock.split(":"))
+            weekdays, clock = value.lower().rsplit(maxsplit=1)
+            days = tuple(sorted({DAY_NAMES.index(day) for day in weekdays.replace(",", " ").split()}))
+            hour, minute = map(int, clock.replace("-", ":").split(":"))
         except ValueError as error:
-            raise ValueError("Use weekdays and HH:MM, for example: mon,thu 13:00") from error
-        updated = replace(settings, days=days, hour=hour, minute=minute, interval_minutes=None)
+            raise ValueError("Use mon tue wed, 14-31 or cron: 0 12 * * 1,4.") from error
+        updated = replace(settings, days=days, hour=hour, minute=minute, interval_minutes=None, cron_expression=None)
     elif field == "timezone":
         updated = replace(settings, timezone=value.strip())
     elif field == "group":
         try:
             chat_id = int(value)
         except ValueError as error:
-            raise ValueError("Send a negative numeric group ID.") from error
+            raise ValueError("Send a negative numeric group or channel ID.") from error
         if chat_id >= 0:
-            raise ValueError("A group ID must be negative.")
+            raise ValueError("A group or channel ID must be negative.")
         updated = replace(settings, chat_id=chat_id)
     else:
         raise ValueError("Unknown setting.")
@@ -91,17 +96,19 @@ class PollBot:
             if settings.interval_minutes is not None
             else f"{days} {settings.hour:02d}:{settings.minute:02d}"
         )
+        if settings.cron_expression is not None:
+            schedule = f"cron: {settings.cron_expression}"
         text = (
             f"Poll settings\n\nQuestion: {settings.question}\n"
             f"Answers: {' / '.join(settings.options)}\n"
             f"Schedule: {schedule}\n"
-            f"Time zone: {settings.timezone}\nGroup: {settings.chat_id or 'Not set'}\n"
+            f"Time zone: {settings.timezone}\nDestination: {settings.chat_id or 'Not set'}\n"
             f"Posting: {'Enabled' if settings.enabled else 'Disabled'}"
         )
         rows = [
             [InlineKeyboardButton("Question", callback_data="question"), InlineKeyboardButton("Answers", callback_data="options")],
             [InlineKeyboardButton("Schedule", callback_data="schedule"), InlineKeyboardButton("Time zone", callback_data="timezone")],
-            [InlineKeyboardButton("Destination group", callback_data="group")],
+            [InlineKeyboardButton("Destination", callback_data="group")],
             [InlineKeyboardButton(f"Anonymous: {'On' if settings.anonymous else 'Off'}", callback_data="anonymous")],
             [InlineKeyboardButton(f"Multiple answers: {'On' if settings.multiple else 'Off'}", callback_data="multiple")],
             [InlineKeyboardButton("Disable" if settings.enabled else "Enable", callback_data="enabled"), InlineKeyboardButton("Preview", callback_data="preview")],
@@ -174,6 +181,26 @@ class PollBot:
         context.user_data.pop("editing", None)
         await self.admin(update, context)
 
+    async def forwarded_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.authorized(update):
+            return
+        origin = update.effective_message.forward_origin
+        if not isinstance(origin, MessageOriginChannel):
+            await update.effective_message.reply_text("Forward an original channel post with its source visible.")
+            return
+        try:
+            member = await context.bot.get_chat_member(origin.chat.id, context.bot.id)
+            if member.status != "administrator" or not getattr(member, "can_post_messages", False):
+                await update.effective_message.reply_text("Make the bot a channel administrator with permission to post messages, then forward the post again.")
+                return
+            self.save(replace(self.settings, chat_id=origin.chat.id, anonymous=True, enabled=False), context.application)
+        except TelegramError:
+            await update.effective_message.reply_text("Could not verify channel access. Check bot membership and administrator permissions.")
+            return
+        context.user_data.pop("editing", None)
+        await update.effective_message.reply_text(f"Destination set to {origin.chat.title}. Channel polls are anonymous. Posting is disabled until you enable it.")
+        await self.admin(update, context)
+
     def save(self, settings: Settings, application: Application) -> None:
         self.store.save(settings)
         self.settings = settings
@@ -187,6 +214,15 @@ class PollBot:
             job.schedule_removal()
         settings = self.settings
         if settings.enabled:
+            if settings.cron_expression is not None:
+                queue.run_custom(
+                    self.scheduled_poll, name="scheduled_poll",
+                    job_kwargs={
+                        "trigger": CrontabTrigger(settings.cron_expression, settings.timezone),
+                        "coalesce": True, "max_instances": 1, "misfire_grace_time": 60,
+                    },
+                )
+                return
             if settings.interval_minutes is not None:
                 interval = timedelta(minutes=settings.interval_minutes)
                 queue.run_repeating(
@@ -265,6 +301,7 @@ def main() -> None:
     application.add_handler(CommandHandler("chatid", bot.chatid))
     application.add_handler(CommandHandler("cancel", bot.cancel))
     application.add_handler(CallbackQueryHandler(bot.button))
+    application.add_handler(MessageHandler(filters.FORWARDED, bot.forwarded_channel))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.text))
     application.add_error_handler(on_error)
     asyncio.set_event_loop(asyncio.new_event_loop())

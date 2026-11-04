@@ -2,9 +2,12 @@ import importlib.util
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+from telegram import Chat
 
 from config import Settings, SettingsStore
 
@@ -64,6 +67,48 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 module.edit_setting(settings, "schedule", value)
 
+    def test_weekday_schedule_accepts_both_formats(self):
+        for value in ("mon tue wed, 14-31", "mon,tue,wed 14:31", " MON TUE WED,   14-31 "):
+            with self.subTest(value=value):
+                settings = module.edit_setting(Settings(), "schedule", value)
+                self.assertEqual(settings.days, (0, 1, 2))
+                self.assertEqual((settings.hour, settings.minute), (14, 31))
+
+    def test_switching_schedule_formats_clears_previous_mode(self):
+        settings = module.edit_setting(Settings(), "schedule", "every 2 minutes")
+        settings = module.edit_setting(settings, "schedule", "cron: 0 12 * * 1,4")
+        self.assertEqual(settings.cron_expression, "0 12 * * 1,4")
+        self.assertIsNone(settings.interval_minutes)
+        settings = module.edit_setting(settings, "schedule", "mon tue wed, 14-31")
+        self.assertIsNone(settings.cron_expression)
+        settings = module.edit_setting(settings, "schedule", "CRON: */2 * * * *")
+        settings = module.edit_setting(settings, "schedule", "every 2 minutes")
+        self.assertIsNone(settings.cron_expression)
+        self.assertEqual(settings.interval_minutes, 2)
+
+    def test_real_cron_scheduler_uses_standard_weekdays_and_timezone(self):
+        application = module.Application.builder().token("123:offline-test-token").build()
+        self.bot.settings = replace(
+            Settings(), enabled=True, chat_id=-100123, timezone="Etc/GMT-4", cron_expression="0 12 * * 1,4",
+        )
+        self.bot.reschedule(application)
+        jobs = application.job_queue.get_jobs_by_name("scheduled_poll")
+        self.assertEqual(len(jobs), 1)
+        trigger = jobs[0].job.trigger
+        now = datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc)
+        first = trigger.get_next_fire_time(None, now)
+        self.assertEqual(first.isoformat(), "2026-11-05T12:00:00+04:00")
+        second = trigger.get_next_fire_time(first, first)
+        self.assertEqual(second.isoformat(), "2026-11-09T12:00:00+04:00")
+        self.assertIn("cron: 0 12 * * 1,4", self.bot.panel()[0])
+
+    def test_invalid_schedule_does_not_change_persisted_settings(self):
+        for value in ("mon tue, 25-00", "bad, 14-31", "cron:", "cron: 0 25 * * *", "cron: 0 12 * * 9", "cron: 0 0 12 * * *"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                settings = module.edit_setting(self.bot.settings, "schedule", value)
+                self.bot.store.save(settings)
+        self.assertEqual(self.bot.store.load(), Settings())
+
     def test_real_interval_scheduler_uses_two_minutes(self):
         application = module.Application.builder().token("123:offline-test-token").build()
         self.bot.settings = replace(
@@ -91,6 +136,42 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(bot=SimpleNamespace(send_poll=AsyncMock()))
         await self.bot.scheduled_poll(context)
         context.bot.send_poll.assert_not_called()
+
+    async def test_forwarded_channel_selects_destination_after_permission_check(self):
+        chat = module.MessageOriginChannel(
+            date=datetime.now(timezone.utc),
+            chat=Chat(-100456, "channel", title="Private Test"),
+            message_id=1,
+        )
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(type="private"),
+            effective_message=SimpleNamespace(forward_origin=chat, reply_text=AsyncMock()),
+        )
+        queue = Mock()
+        queue.get_jobs_by_name.return_value = ()
+        context = SimpleNamespace(
+            user_data={}, application=SimpleNamespace(job_queue=queue),
+            bot=SimpleNamespace(id=789, get_chat_member=AsyncMock(return_value=SimpleNamespace(status="administrator", can_post_messages=True))),
+        )
+        await self.bot.forwarded_channel(update, context)
+        self.assertEqual(self.bot.settings.chat_id, -100456)
+        self.assertTrue(self.bot.settings.anonymous)
+        self.assertFalse(self.bot.settings.enabled)
+        self.assertEqual(self.bot.store.load(), self.bot.settings)
+        update.effective_user.id = 456
+        context.bot.get_chat_member.reset_mock()
+        await self.bot.forwarded_channel(update, context)
+        context.bot.get_chat_member.assert_not_called()
+
+    async def test_forwarded_channel_rejects_missing_post_permission(self):
+        origin = module.MessageOriginChannel(datetime.now(timezone.utc), Chat(-100456, "channel"), 1)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(type="private"),
+            effective_message=SimpleNamespace(forward_origin=origin, reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(id=789, get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member"))))
+        await self.bot.forwarded_channel(update, context)
+        self.assertIsNone(self.bot.settings.chat_id)
 
     def test_real_scheduler_accepts_settings(self):
         application = module.Application.builder().token("123:offline-test-token").build()
