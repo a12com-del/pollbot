@@ -6,14 +6,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY requirements.txt ./
+COPY --chmod=0644 requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt \
     && groupadd --gid 10001 bot \
     && useradd --uid 10001 --gid bot --no-create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /app/data \
     && chown bot:bot /app/data
 
-COPY vote-bot.py config.py ./
+COPY --chmod=0644 vote-bot.py config.py ./
 
 USER 10001:10001
 

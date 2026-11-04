@@ -75,6 +75,27 @@ the run command using the same named volume. Stop before replacing it to avoid
 two simultaneous Telegram pollers. Back up the SQLite database using SQLite's
 backup API; don't copy a live database file directly.
 
+### Permission Denied on Startup
+
+If Python cannot open `/app/vote-bot.py`, a restrictive source file mode may
+have been inherited by an older image. The Dockerfile now explicitly copies
+application files with mode `0644` so runtime UID `10001` can read them.
+Do not work around this by running the bot as root or using `chmod 777`.
+
+After updating the Dockerfile on the VM, rebuild and replace the container:
+
+```sh
+podman build --no-cache --tag vote-bot:local .
+podman stop --time 30 vote-bot
+podman rm vote-bot
+```
+
+Repeat the original `podman run` command with the same `vote-bot-data` volume.
+Do not delete or re-import the volume. Rebuilding alone does not update an
+existing container. If you additionally bind-mount source code onto `/app`, its
+host permissions and, on SELinux hosts, volume labels must also allow access;
+image permissions cannot override a bind mount.
+
 On a Linux VM with Docker, the same commands work by replacing `podman` with
 `docker`. Build on the target VM to match its CPU architecture; a locally built
 Apple Silicon image is ARM64. With Podman on Linux, use a systemd/Quadlet service
