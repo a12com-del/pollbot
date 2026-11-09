@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from string import Formatter
@@ -124,6 +124,7 @@ class SettingsStore:
             connection.execute("BEGIN IMMEDIATE")
             initialized = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'polls'").fetchone()
             connection.execute("CREATE TABLE IF NOT EXISTS polls (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS admin_defaults (admin_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
             if initialized is None:
                 legacy = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").fetchone()
                 row = connection.execute("SELECT data FROM settings WHERE id = 1").fetchone() if legacy else None
@@ -168,3 +169,21 @@ class SettingsStore:
     def delete(self, poll_id: int) -> None:
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
+
+    def load_defaults(self, admin_id: int) -> Settings:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            row = connection.execute("SELECT data FROM admin_defaults WHERE admin_id = ?", (admin_id,)).fetchone()
+        return replace(self.decode(row[0]), enabled=False) if row else Settings()
+
+    def save_defaults(self, admin_id: int, settings: Settings) -> None:
+        settings = replace(settings, enabled=False)
+        settings.validate()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO admin_defaults (admin_id, data) VALUES (?, ?)",
+                (admin_id, json.dumps(asdict(settings))),
+            )
+
+    def reset_defaults(self, admin_id: int) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DELETE FROM admin_defaults WHERE admin_id = ?", (admin_id,))

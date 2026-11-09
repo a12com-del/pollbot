@@ -130,11 +130,14 @@ class PollBot:
             navigation.append(InlineKeyboardButton("Next", callback_data=f"list:{page + 1}"))
         if navigation:
             rows.append(navigation)
-        rows.append([InlineKeyboardButton("New poll", callback_data="new:0")])
+        rows.append([
+            InlineKeyboardButton("New poll", callback_data="new:0"),
+            InlineKeyboardButton("My defaults", callback_data="defaults:0"),
+        ])
         return f"Polls\n\n{len(items)} configured", InlineKeyboardMarkup(rows)
 
-    def panel(self, poll_id: int = 1) -> tuple[str, InlineKeyboardMarkup]:
-        settings = self.polls[poll_id]
+    def panel(self, poll_id: int = 1, defaults: Settings | None = None) -> tuple[str, InlineKeyboardMarkup]:
+        settings = defaults if defaults is not None else self.polls[poll_id]
         days = ",".join(DAY_NAMES[day] for day in settings.days)
         schedule = (
             f"Every {settings.interval_minutes} minutes"
@@ -143,13 +146,24 @@ class PollBot:
         )
         if settings.cron_expression is not None:
             schedule = f"cron: {settings.cron_expression}"
+        heading = "My defaults" if defaults is not None else f"Poll: {settings.name}"
         text = (
-            f"Poll: {settings.name}\n\nQuestion: {settings.question}\n"
+            f"{heading}\n\nQuestion: {settings.question}\n"
             f"Answers: {' / '.join(settings.options)}\n"
             f"Schedule: {schedule}\n"
             f"Time zone: {settings.timezone}\nDestination: {settings.destination_name}\n"
             f"Posting: {'Enabled' if settings.enabled else 'Disabled'}"
         )
+        if defaults is not None:
+            text += (
+                f"\nAnonymous: {'On' if settings.anonymous else 'Off'}"
+                f"\nMultiple answers: {'On' if settings.multiple else 'Off'}"
+            )
+            return text, InlineKeyboardMarkup([
+                [InlineKeyboardButton("New poll", callback_data="new:0")],
+                [InlineKeyboardButton("Reset defaults...", callback_data="reset_defaults:0")],
+                [InlineKeyboardButton("All polls", callback_data="list:0")],
+            ])
         rows = [
             [InlineKeyboardButton("Name", callback_data="name")],
             [InlineKeyboardButton("Question", callback_data="question"), InlineKeyboardButton("Answers", callback_data="options")],
@@ -159,6 +173,7 @@ class PollBot:
             [InlineKeyboardButton(f"Multiple answers: {'On' if settings.multiple else 'Off'}", callback_data="multiple")],
             [InlineKeyboardButton("Disable" if settings.enabled else "Enable", callback_data="enabled"), InlineKeyboardButton("Preview", callback_data="preview")],
             [InlineKeyboardButton("Send now...", callback_data="sendnow")],
+            [InlineKeyboardButton("Save as my defaults", callback_data="save_defaults")],
             [InlineKeyboardButton("Delete poll...", callback_data="delete")],
         ]
         rows = [[InlineKeyboardButton(button.text, callback_data=f"{button.callback_data}:{poll_id}") for button in row] for row in rows]
@@ -174,6 +189,15 @@ class PollBot:
         context.user_data.pop("editing", None)
         context.user_data.pop("editing_poll_id", None)
         text, keyboard = self.panel(poll_id)
+        await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+    async def defaults(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.authorized(update):
+            return
+        context.user_data.pop("editing", None)
+        context.user_data.pop("editing_poll_id", None)
+        context.user_data.pop("poll_id", None)
+        text, keyboard = self.panel(defaults=self.store.load_defaults(update.effective_user.id))
         await update.effective_message.reply_text(text, reply_markup=keyboard)
 
     async def destinations(self, update: Update, context: ContextTypes.DEFAULT_TYPE, poll_id: int, page: int = 0) -> None:
@@ -239,13 +263,31 @@ class PollBot:
             return
         context.user_data.pop("editing", None)
         context.user_data.pop("editing_poll_id", None)
+        if action == "defaults":
+            await self.defaults(update, context)
+            return
+        if action == "reset_defaults":
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Reset my defaults", callback_data="confirm_reset_defaults:0"),
+                InlineKeyboardButton("Cancel", callback_data="defaults:0"),
+            ]])
+            await update.effective_message.reply_text("Reset your defaults to built-in values? Existing polls will not change.", reply_markup=keyboard)
+            return
+        if action == "confirm_reset_defaults":
+            await query.edit_message_reply_markup(reply_markup=None)
+            self.store.reset_defaults(update.effective_user.id)
+            await self.defaults(update, context)
+            return
         if action == "list":
             context.user_data.pop("poll_id", None)
             text, keyboard = self.overview(poll_id)
             await update.effective_message.reply_text(text, reply_markup=keyboard)
             return
         if action == "new":
-            settings = Settings(name=f"Poll {max(self.polls, default=0) + 1}")
+            settings = replace(
+                self.store.load_defaults(update.effective_user.id),
+                name=f"Poll {max(self.polls, default=0) + 1}", enabled=False,
+            )
             poll_id = self.store.create(settings)
             self.polls[poll_id] = settings
             await self.show_poll(update, context, poll_id)
@@ -258,7 +300,11 @@ class PollBot:
             return
         context.user_data["poll_id"] = poll_id
         settings = self.polls[poll_id]
-        if action == "open" or action == "cancel":
+        if action == "save_defaults":
+            self.store.save_defaults(update.effective_user.id, settings)
+            await update.effective_message.reply_text("Saved as your defaults. New polls will start disabled; existing polls are unchanged.")
+            await self.defaults(update, context)
+        elif action == "open" or action == "cancel":
             if action == "cancel":
                 await query.edit_message_reply_markup(reply_markup=None)
             await self.show_poll(update, context, poll_id)
@@ -495,6 +541,7 @@ def main() -> None:
     bot = PollBot(SettingsStore(base / "data" / "settings.db"), admins)
     application = Application.builder().token(token).post_init(bot.startup).build()
     application.add_handler(CommandHandler(["start", "admin"], bot.admin))
+    application.add_handler(CommandHandler("defaults", bot.defaults))
     application.add_handler(CommandHandler("chatid", bot.chatid))
     application.add_handler(CommandHandler("cancel", bot.cancel))
     application.add_handler(CallbackQueryHandler(bot.button))

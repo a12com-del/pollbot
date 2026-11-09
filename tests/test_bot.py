@@ -49,6 +49,83 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.bot.polls[poll_id] = settings
         return poll_id
 
+    async def test_saved_personal_defaults_create_independent_disabled_poll(self):
+        source = replace(
+            Settings(), name="Evening class", question="Joining {weekday}?", options=("Yes", "No", "Maybe"),
+            chat_id=-100123, destination_label="Studio", message_thread_id=42,
+            timezone="Etc/GMT-4", cron_expression="0 18 * * 1,4", anonymous=True, multiple=True, enabled=True,
+        )
+        self.bot.settings = source
+        self.bot.store.save(source)
+        context = self.make_context()
+        saved = self.make_update("save_defaults:1")
+        await self.bot.button(saved, context)
+        self.assertIn("My defaults", saved.effective_message.reply_text.call_args.args[0])
+        self.assertEqual(self.bot.store.load(), source)
+        self.assertFalse(self.bot.store.load_defaults(123).enabled)
+        await self.bot.button(self.make_update("new:0"), context)
+        poll_id = context.user_data["poll_id"]
+        self.assertEqual(self.bot.polls[poll_id], replace(source, name="Poll 2", enabled=False))
+        self.assertEqual(self.bot.store.load(), source)
+        self.assertEqual(len(self.bot.polls), 2)
+        context.application.job_queue.run_custom.assert_not_called()
+        self.bot.save(replace(self.bot.polls[poll_id], question="Only this poll?"), context.application, poll_id)
+        self.assertEqual(self.bot.store.load_defaults(123).question, "Joining {weekday}?")
+
+    async def test_personal_defaults_survive_restart_and_do_not_affect_other_admins(self):
+        self.bot.store.save_defaults(123, replace(Settings(), question="First admin?", interval_minutes=2))
+        self.bot.admin_ids.add(456)
+        restarted = module.PollBot(self.bot.store, self.bot.admin_ids)
+        first_context = self.make_context()
+        second_context = self.make_context()
+        await restarted.button(self.make_update("new:0"), first_context)
+        await restarted.button(self.make_update("new:0", user_id=456), second_context)
+        first = restarted.polls[first_context.user_data["poll_id"]]
+        second = restarted.polls[second_context.user_data["poll_id"]]
+        self.assertEqual(first.question, "First admin?")
+        self.assertEqual(first.interval_minutes, 2)
+        self.assertEqual(second.question, Settings().question)
+        self.assertIsNone(second.interval_minutes)
+
+    async def test_defaults_reset_requires_confirmation_and_only_resets_current_admin(self):
+        self.bot.store.save_defaults(123, replace(Settings(), question="Mine?"))
+        self.bot.store.save_defaults(456, replace(Settings(), question="Other?"))
+        context = self.make_context()
+        await self.bot.button(self.make_update("reset_defaults:0"), context)
+        self.assertEqual(self.bot.store.load_defaults(123).question, "Mine?")
+        await self.bot.button(self.make_update("defaults:0"), context)
+        self.assertEqual(self.bot.store.load_defaults(123).question, "Mine?")
+        await self.bot.button(self.make_update("confirm_reset_defaults:0"), context)
+        self.assertEqual(self.bot.store.load_defaults(123), Settings())
+        self.assertEqual(self.bot.store.load_defaults(456).question, "Other?")
+        self.assertEqual(self.bot.store.list_polls(), {1: Settings()})
+
+    async def test_channel_defaults_preserve_anonymity_and_work_without_source_poll(self):
+        source = replace(Settings(), name="Channel poll", chat_id=-100123, is_channel=True, anonymous=True)
+        self.bot.settings = source
+        self.bot.store.save(source)
+        context = self.make_context()
+        await self.bot.button(self.make_update("save_defaults:1"), context)
+        self.bot.store.delete(1)
+        self.bot.polls.pop(1)
+        await self.bot.defaults(self.make_update(), context)
+        await self.bot.button(self.make_update("new:0"), context)
+        created = self.bot.polls[context.user_data["poll_id"]]
+        self.assertTrue(created.is_channel)
+        self.assertTrue(created.anonymous)
+        self.assertFalse(created.enabled)
+
+    async def test_unauthorized_users_cannot_read_save_or_reset_defaults(self):
+        context = self.make_context()
+        update = self.make_update(user_id=456)
+        await self.bot.defaults(update, context)
+        update.effective_message.reply_text.assert_not_called()
+        self.bot.store.save_defaults(456, replace(Settings(), question="Saved?"))
+        for action in ("defaults:0", "save_defaults:1", "reset_defaults:0", "confirm_reset_defaults:0"):
+            await self.bot.button(self.make_update(action, user_id=456), context)
+        self.assertEqual(self.bot.store.load_defaults(456).question, "Saved?")
+        self.assertEqual(len(self.bot.polls), 1)
+
     def test_three_schedule_modes_create_independent_jobs(self):
         application = module.Application.builder().token("123:offline-test-token").build()
         self.bot.settings = replace(Settings(), enabled=True, chat_id=-100123, hour=9)

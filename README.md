@@ -309,6 +309,33 @@ Each poll posts to one destination. To send the same question to two destination
 or on two separate schedules, create two poll configurations. Different admins
 can select and edit different polls without sharing a current selection.
 
+### Personal Poll Defaults
+
+Each allowlisted admin can save their own starting values for **New poll**:
+
+1. Select an existing poll in `/admin`, or create one to use as a template.
+   Configure its question, answer options, schedule, time zone, destination,
+   topic, label, and voting preferences. Leave it disabled if it is only a template.
+2. Press **Save as my defaults** in that poll's panel. This stores a snapshot
+   for your Telegram user ID; it does not change the source poll or its schedule.
+3. Use **New poll** to create similar polls with those values already filled in.
+   Each gets a fresh name and starts **disabled**, even if the source poll was
+   enabled. Change the name and any differing values, then explicitly enable it.
+4. Open **My defaults** from the poll list, or send `/defaults` privately, to
+   review your saved values. **Reset defaults...** restores the built-in values
+   after confirmation, without changing any existing polls or other admins' defaults.
+
+To update your defaults, configure any poll with the desired values and press
+**Save as my defaults** again. Editing or deleting the source poll later does
+not alter the saved snapshot. Editing a new poll also does not change defaults.
+Other admins use their own defaults, or the built-in values if they have not
+saved any. Channel templates keep anonymous voting as required by Telegram.
+
+Defaults persist in the existing SQLite database and container data volume,
+survive restarts, and do not have scheduled jobs of their own. No environment
+variable changes are needed. All new-poll entry points use the creating admin's
+saved defaults, but never inherit the source poll's name or enabled state.
+
 ### Forum Topics in Groups
 
 1. In the desired group topic, send `/chatid@YourBotUsername` from an allowlisted

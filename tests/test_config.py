@@ -11,6 +11,37 @@ from config import CrontabTrigger, Settings, SettingsStore
 
 
 class SettingsTests(unittest.TestCase):
+    def test_admin_defaults_are_persistent_private_snapshots_and_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.db"
+            store = SettingsStore(path)
+            original = replace(
+                Settings(), name="Class", question="Joining {date}?", options=("Join", "Skip"),
+                timezone="Etc/GMT-4", chat_id=-100123, message_thread_id=42,
+                destination_label="Studio", cron_expression="0 12 * * 1,4", multiple=True, enabled=True,
+            )
+            store.save_defaults(123, original)
+            reloaded = SettingsStore(path)
+            self.assertEqual(reloaded.load_defaults(123), replace(original, enabled=False))
+            self.assertEqual(reloaded.load_defaults(456), Settings())
+            self.assertEqual(reloaded.list_polls(), {1: Settings()})
+            store.save(replace(original, question="Changed?"))
+            store.delete(1)
+            self.assertEqual(reloaded.load_defaults(123).question, "Joining {date}?")
+            store.save_defaults(456, replace(Settings(), question="Other admin?"))
+            store.reset_defaults(123)
+            self.assertEqual(reloaded.load_defaults(123), Settings())
+            self.assertEqual(reloaded.load_defaults(456).question, "Other admin?")
+
+    def test_invalid_defaults_do_not_overwrite_saved_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.db")
+            saved = replace(Settings(), question="Saved?")
+            store.save_defaults(123, saved)
+            with self.assertRaises(ValueError):
+                store.save_defaults(123, replace(saved, options=("One",)))
+            self.assertEqual(store.load_defaults(123), saved)
+
     def test_variables_use_configured_local_time(self):
         settings = Settings(question="{date} {weekday} {time}", timezone="Europe/Warsaw")
         now = datetime(2026, 11, 4, 23, 30, tzinfo=timezone.utc)
