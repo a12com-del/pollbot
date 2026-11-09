@@ -50,6 +50,10 @@ class SettingsTests(unittest.TestCase):
             {"cron_expression": "0 12 31 2 *"},
             {"name": " "}, {"name": "a" * 61}, {"name": "One\nTwo"},
             {"destination_label": "a" * 61}, {"is_channel": True, "anonymous": False},
+            {"message_thread_id": 0}, {"message_thread_id": -1},
+            {"message_thread_id": True}, {"message_thread_id": 1.5},
+            {"message_thread_id": 42},
+            {"message_thread_id": 42, "chat_id": -100123, "is_channel": True},
         )
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
@@ -60,7 +64,7 @@ class SettingsTests(unittest.TestCase):
             path = Path(directory) / "settings.db"
             legacy = replace(Settings(), chat_id=-100123, enabled=True, cron_expression="0 12 * * 1,4")
             values = asdict(legacy)
-            for field in ("name", "destination_label", "is_channel"):
+            for field in ("name", "destination_label", "is_channel", "message_thread_id"):
                 values.pop(field)
             with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
@@ -70,6 +74,16 @@ class SettingsTests(unittest.TestCase):
             changed = replace(legacy, name="Morning class", destination_label="Main group")
             store.save(changed)
             self.assertEqual(SettingsStore(path).load(), changed)
+
+    def test_topic_settings_persist_and_old_records_default_to_no_topic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.db"
+            settings = replace(Settings(), chat_id=-100123, message_thread_id=42, destination_label="Studio")
+            SettingsStore(path).save(settings)
+            self.assertEqual(SettingsStore(path).load(), settings)
+            values = asdict(settings)
+            values.pop("message_thread_id")
+            self.assertIsNone(SettingsStore.decode(json.dumps(values)).message_thread_id)
 
     def test_multiple_polls_are_independent_and_persisted(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -48,8 +48,14 @@ class Settings:
     name: str = "Poll 1"
     destination_label: str = ""
     is_channel: bool = False
+    message_thread_id: int | None = None
 
     def validate(self) -> None:
+        if self.message_thread_id is not None:
+            if type(self.message_thread_id) is not int or self.message_thread_id <= 0:
+                raise ValueError("Topic ID must be a positive whole number.")
+            if self.chat_id is None or self.is_channel:
+                raise ValueError("Topics require a group destination, not a channel.")
         if not self.name.strip() or len(self.name) > 60 or "\n" in self.name:
             raise ValueError("Poll name must contain 1 to 60 characters on one line.")
         if len(self.destination_label) > 60 or "\n" in self.destination_label:
@@ -83,6 +89,11 @@ class Settings:
         self.render()
         if self.enabled and self.chat_id is None:
             raise ValueError("Set the destination group before enabling the schedule.")
+
+    @property
+    def destination_name(self) -> str:
+        label = self.destination_label or ("Unnamed destination" if self.chat_id else "Not set")
+        return f"{label} > Topic {self.message_thread_id}" if self.message_thread_id is not None else label
 
     @property
     def question_template(self) -> str:

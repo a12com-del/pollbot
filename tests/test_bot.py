@@ -210,9 +210,92 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         settings = module.edit_setting(settings, "group", "-100123")
         self.assertEqual(settings.options, ("Yes", "No", "Maybe"))
         self.assertEqual(settings.chat_id, -100123)
-        for field, value in (("schedule", "bad"), ("schedule", "mon 25:00"), ("group", "123")):
+        for field, value in (("schedule", "bad"), ("schedule", "mon 25:00"), ("group", "0")):
             with self.assertRaises(ValueError):
                 module.edit_setting(settings, field, value)
+
+    def test_chat_ids_are_normalized_and_group_changes_clear_topic(self):
+        original = replace(Settings(), chat_id=-100456, message_thread_id=42, enabled=True)
+        for value in ("100123", "-100123", " +100123 "):
+            with self.subTest(value=value):
+                settings = module.edit_setting(original, "group", value)
+                self.assertEqual(settings.chat_id, -100123)
+                self.assertIsNone(settings.message_thread_id)
+                self.assertFalse(settings.enabled)
+        for value in ("0", "-0", "abc", "1.5"):
+            with self.assertRaises(ValueError):
+                module.edit_setting(original, "group", value)
+
+    async def test_topic_is_sent_to_group_but_not_private_preview(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, message_thread_id=42, enabled=True)
+        context = self.make_context()
+        await self.bot.send_poll(context)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["message_thread_id"], 42)
+        context.job = SimpleNamespace(data=1)
+        await self.bot.scheduled_poll(context)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["message_thread_id"], 42)
+        await self.bot.send_with_feedback(self.make_update(), context, preview=True)
+        self.assertEqual(context.bot.send_poll.call_args.kwargs["chat_id"], 123)
+        self.assertNotIn("message_thread_id", context.bot.send_poll.call_args.kwargs)
+
+    async def test_topic_destinations_in_same_group_stay_distinct_and_can_be_reused(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, message_thread_id=42, destination_label="Studio")
+        second = self.add_poll(name="Evening", chat_id=-100123, message_thread_id=84, destination_label="Studio")
+        third = self.add_poll(name="Weekend")
+        context = self.make_context()
+        update = self.make_update(f"destination:{third}")
+        await self.bot.button(update, context)
+        rows = update.effective_message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual([rows[0][0].text, rows[1][0].text], ["Studio > Topic 42", "Studio > Topic 84"])
+        await self.bot.button(self.make_update(f"dest:{third}:{second}"), context)
+        self.assertEqual(self.bot.store.load(third).message_thread_id, 84)
+
+    async def test_chatid_reports_topic_id(self):
+        update = self.make_update()
+        update.effective_chat = SimpleNamespace(id=-100123, type="supergroup")
+        update.effective_message.message_thread_id = 42
+        await self.bot.chatid(update, self.make_context())
+        update.effective_message.reply_text.assert_awaited_once_with("Chat ID: -100123\nTopic ID: 42")
+
+    async def test_topic_can_be_configured_and_cleared_in_forum_group(self):
+        self.bot.settings = replace(Settings(), chat_id=-100789, enabled=True)
+        context = self.make_context()
+        context.bot.get_chat.return_value = Chat(-100789, "supergroup", title="Studio", is_forum=True)
+        await self.bot.button(self.make_update("topic:1"), context)
+        await self.bot.text(self.make_update(text="42"), context)
+        settings = self.bot.store.load()
+        self.assertEqual(settings.message_thread_id, 42)
+        self.assertFalse(settings.enabled)
+        await self.bot.button(self.make_update("topic:1"), context)
+        await self.bot.text(self.make_update(text="0"), context)
+        self.assertIsNone(self.bot.store.load().message_thread_id)
+        self.assertEqual(context.bot.get_chat.await_count, 1)
+
+    async def test_topic_rejected_for_nonforum_group_without_saving(self):
+        self.bot.settings = replace(Settings(), chat_id=-100789)
+        self.bot.store.save(self.bot.settings)
+        context = self.make_context()
+        await self.bot.button(self.make_update("topic:1"), context)
+        update = self.make_update(text="42")
+        await self.bot.text(update, context)
+        self.assertIsNone(self.bot.store.load().message_thread_id)
+        self.assertIn("forum topics", update.effective_message.reply_text.call_args.args[0])
+
+    def test_invalid_topic_inputs_are_rejected(self):
+        settings = replace(Settings(), chat_id=-100123)
+        for value in ("-1", "abc", "1.5"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                module.edit_setting(settings, "topic", value)
+        for settings in (Settings(), replace(settings, is_channel=True)):
+            with self.assertRaises(ValueError):
+                module.edit_setting(settings, "topic", "42")
+
+    async def test_positive_chat_input_is_normalized_before_lookup(self):
+        context = self.make_context()
+        await self.bot.button(self.make_update("group:1"), context)
+        await self.bot.text(self.make_update(text="100789"), context)
+        context.bot.get_chat.assert_awaited_once_with(-100789)
+        self.assertEqual(self.bot.store.load().chat_id, -100789)
 
     def test_reschedule_replaces_job_and_uses_local_timezone(self):
         application = SimpleNamespace(job_queue=Mock())
@@ -310,6 +393,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         context.bot.send_poll.assert_not_called()
 
     async def test_forwarded_channel_selects_destination_after_permission_check(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, message_thread_id=42)
         chat = module.MessageOriginChannel(
             date=datetime.now(timezone.utc),
             chat=Chat(-100456, "channel", title="Private Test"),
@@ -327,6 +411,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.bot.forwarded_channel(update, context)
         self.assertEqual(self.bot.settings.chat_id, -100456)
+        self.assertIsNone(self.bot.settings.message_thread_id)
         self.assertTrue(self.bot.settings.anonymous)
         self.assertFalse(self.bot.settings.enabled)
         self.assertEqual(self.bot.store.load(), self.bot.settings)

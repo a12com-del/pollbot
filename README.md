@@ -259,8 +259,9 @@ Alternatively, install `python-telegram-bot[job-queue]>=22,<23` and
 
 5. Open a private conversation with the bot and send `/start` or `/admin`.
 6. Select a poll in `/admin`, or choose **New poll** and name it. In the target
-   group, send `/chatid@YourBotUsername`. Enter that negative
-   ID using **Destination** in the private panel. For a channel, make the bot
+   group, send `/chatid@YourBotUsername`. Enter its full chat ID using
+   **Destination** in the private panel; a missing minus sign is added
+   automatically. For a channel, make the bot
    an administrator with permission to post messages, then forward an original
    channel post to the bot privately. This selects the channel, verifies posting
    permission, and disables posting until you explicitly enable it. Channel polls
@@ -307,6 +308,55 @@ and apply without restarting.
 Each poll posts to one destination. To send the same question to two destinations
 or on two separate schedules, create two poll configurations. Different admins
 can select and edit different polls without sharing a current selection.
+
+### Forum Topics in Groups
+
+1. In the desired group topic, send `/chatid@YourBotUsername` from an allowlisted
+   admin account. The reply includes the group **Chat ID** and, when present,
+   the **Topic ID** (`message_thread_id`).
+2. Select the poll in `/admin`, then use **Destination > Enter chat ID** to
+   set the group. Positive numeric chat IDs are converted to negative IDs;
+   negative IDs remain unchanged and zero is rejected. This only adds the
+   minus sign: it does not add a missing `100` prefix or reconstruct shortened
+   IDs from Telegram links. Use the complete chat ID reported by the bot.
+3. Use **Destination > Topic** and enter the positive topic ID. The bot checks
+   that the selected group has forum topics enabled. Enter `0` to clear the
+   topic and use the group's default destination (normally General).
+4. Optionally use **Edit label** for a friendly name. Panels distinguish topics
+   as `Studio > Topic 42`, and two topics in the same group remain separate
+   reusable destinations. Selecting a saved destination copies its topic too.
+5. Changing the topic disables this poll until you explicitly **Enable** it.
+   **Preview** posts privately without a topic; **Send now...** and scheduled
+   posting use the configured topic. Use a confirmed **Send now...** to check
+   actual topic delivery before enabling the schedule.
+
+Changing or re-entering the group ID, or selecting a forwarded channel post,
+clears the previous topic. Topics cannot be configured for channels. The topic
+must exist and be open, and the bot needs permission to send messages and polls
+there. The bot does not create, reopen, or list topics. Existing saved polls
+default to no topic, preserving their previous destination behavior.
+
+#### Example: Send Polls to General
+
+For Telegram's built-in **General** topic, suppose `/chatid@YourBotUsername`
+reports chat ID `-1001234567890` (an illustrative ID; use your group's real ID):
+
+1. Open a private chat with the bot, send `/admin`, and select your poll.
+2. Choose **Destination > Enter chat ID** and enter `-1001234567890`.
+   Entering `1001234567890` also works; the bot adds the minus sign.
+3. Choose **Destination > Topic** and enter `0`. This clears the topic setting
+   so Telegram uses the group's default **General** topic. The bot omits
+   `message_thread_id` when sending; it does not send a literal topic ID of zero.
+4. Choose **Destination > Edit label** and enter `Studio > General`.
+   This is a display label, not a topic name lookup.
+5. Return to the poll and confirm **Send now...** to verify it appears in
+   General. Then **Enable** scheduled posting if desired. **Preview** only
+   sends a private test poll, so it does not verify topic delivery.
+
+This selects the existing General topic; it does not create one. General must
+be available for posting. For a custom topic, even one named `general`, run
+`/chatid@YourBotUsername` inside that topic and enter its positive **Topic ID**
+instead of `0`. The **Topic** setting accepts numbers, not topic names.
 
 ### Upgrading from a Single Poll
 
@@ -400,5 +450,6 @@ hour like the default 13:00.
 Tests cover persistence, validation, local date rendering, weekday mapping,
 admin authorization, preview/group destinations, voting settings, both schedule
 formats, standard cron semantics, scheduler integration, multi-poll migration,
-independent jobs, poll management, and labelled destination selection. They do
-not require a token and do not send real Telegram messages.
+independent jobs, poll management, labelled destination selection, forum topic
+routing, preview isolation, and chat ID sign normalization. They do not require
+a token and do not send real Telegram messages.

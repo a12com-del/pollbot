@@ -30,7 +30,8 @@ PROMPTS = {
     "options": "Send 2 to 10 answer options, one per line.",
     "schedule": "Send weekdays and time (mon tue wed, 14-31), or cron: 0 12 * * 1,4. Interval schedules (every 2 minutes) also work.",
     "timezone": "Send an IANA time zone, for example: Europe/Warsaw",
-    "group": "Send the destination chat ID (a negative number), or forward a channel post here. Use /chatid in a group to get its ID.",
+    "group": "Send the destination chat ID, or forward a channel post here. A missing minus sign is added automatically. Use /chatid in a group to get its full ID.",
+    "topic": "Send the positive topic ID, or 0 for the group's default destination. Use /chatid inside the topic to get its ID.",
 }
 
 
@@ -70,12 +71,22 @@ def edit_setting(settings: Settings, field: str, value: str) -> Settings:
         updated = replace(settings, timezone=value.strip())
     elif field == "group":
         try:
-            chat_id = int(value)
+            chat_id = -abs(int(value))
         except ValueError as error:
-            raise ValueError("Send a negative numeric group or channel ID.") from error
-        if chat_id >= 0:
-            raise ValueError("A group or channel ID must be negative.")
-        updated = replace(settings, chat_id=chat_id, destination_label="", is_channel=False, enabled=False)
+            raise ValueError("Send a numeric group or channel ID.") from error
+        if chat_id == 0:
+            raise ValueError("A group or channel ID cannot be zero.")
+        updated = replace(settings, chat_id=chat_id, message_thread_id=None, destination_label="", is_channel=False, enabled=False)
+    elif field == "topic":
+        if settings.chat_id is None or settings.is_channel:
+            raise ValueError("Select a group destination before setting a topic.")
+        try:
+            topic_id = int(value)
+        except ValueError as error:
+            raise ValueError("Send a positive topic ID, or 0 to clear it.") from error
+        if topic_id < 0:
+            raise ValueError("Send a positive topic ID, or 0 to clear it.")
+        updated = replace(settings, message_thread_id=topic_id or None, enabled=False)
     else:
         raise ValueError("Unknown setting.")
     updated.validate()
@@ -109,7 +120,7 @@ class PollBot:
         page = max(0, min(page, max(0, (len(items) - 1) // 8)))
         rows = []
         for poll_id, settings in items[page * 8:(page + 1) * 8]:
-            destination = settings.destination_label or ("Unnamed destination" if settings.chat_id else "No destination")
+            destination = settings.destination_name
             label = f"{'On' if settings.enabled else 'Off'}: {settings.name[:26]} > {destination[:26]}"
             rows.append([InlineKeyboardButton(label, callback_data=f"open:{poll_id}")])
         navigation = []
@@ -136,7 +147,7 @@ class PollBot:
             f"Poll: {settings.name}\n\nQuestion: {settings.question}\n"
             f"Answers: {' / '.join(settings.options)}\n"
             f"Schedule: {schedule}\n"
-            f"Time zone: {settings.timezone}\nDestination: {settings.destination_label or ('Unnamed destination' if settings.chat_id else 'Not set')}\n"
+            f"Time zone: {settings.timezone}\nDestination: {settings.destination_name}\n"
             f"Posting: {'Enabled' if settings.enabled else 'Disabled'}"
         )
         rows = [
@@ -170,11 +181,11 @@ class PollBot:
         sources = {}
         for source_id, settings in self.polls.items():
             if settings.chat_id is not None:
-                sources.setdefault(settings.chat_id, (source_id, settings))
+                sources.setdefault((settings.chat_id, settings.message_thread_id), (source_id, settings))
         items = list(sources.values())
         page = max(0, min(page, max(0, (len(items) - 1) // 8)))
         rows = [[InlineKeyboardButton(
-            settings.destination_label or f"Destination of {settings.name}",
+            settings.destination_name,
             callback_data=f"dest:{poll_id}:{source_id}",
         )] for source_id, settings in items[page * 8:(page + 1) * 8]]
         navigation = []
@@ -186,6 +197,7 @@ class PollBot:
             rows.append(navigation)
         rows.extend([
             [InlineKeyboardButton("Enter chat ID", callback_data=f"group:{poll_id}")],
+            [InlineKeyboardButton("Topic", callback_data=f"topic:{poll_id}")],
             [InlineKeyboardButton("Edit label", callback_data=f"destination_label:{poll_id}")],
             [InlineKeyboardButton("Back to poll", callback_data=f"open:{poll_id}")],
         ])
@@ -202,7 +214,11 @@ class PollBot:
 
     async def chatid(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.authorized(update, private=False):
-            await update.effective_message.reply_text(f"Chat ID: {update.effective_chat.id}")
+            text = f"Chat ID: {update.effective_chat.id}"
+            topic_id = getattr(update.effective_message, "message_thread_id", None)
+            if topic_id is not None:
+                text += f"\nTopic ID: {topic_id}"
+            await update.effective_message.reply_text(text)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.authorized(update):
@@ -256,6 +272,7 @@ class PollBot:
                 return
             self.save(replace(
                 settings, chat_id=source.chat_id, destination_label=source.destination_label,
+                message_thread_id=source.message_thread_id,
                 is_channel=source.is_channel, anonymous=True if source.is_channel else settings.anonymous, enabled=False,
             ), context.application, poll_id)
             await self.show_poll(update, context, poll_id)
@@ -317,6 +334,13 @@ class PollBot:
                     updated, destination_label=(chat.title or chat.username or "Destination")[:60],
                     is_channel=chat.type == "channel", anonymous=True if chat.type == "channel" else updated.anonymous,
                 )
+            elif field == "topic" and updated.message_thread_id is not None:
+                chat = await context.bot.get_chat(updated.chat_id)
+                if not getattr(chat, "is_forum", False):
+                    raise ValueError("This group does not have forum topics enabled.")
+                if poll_id not in self.polls or self.polls[poll_id].chat_id != updated.chat_id:
+                    raise ValueError("The destination changed. Select the poll and try again.")
+                updated = edit_setting(self.polls[poll_id], field, update.effective_message.text)
             self.save(updated, context.application, poll_id)
         except TelegramError:
             await update.effective_message.reply_text("Could not access this destination. Check the ID and bot membership, then try again or /cancel.")
@@ -351,7 +375,7 @@ class PollBot:
             self.save(replace(
                 self.polls[poll_id], chat_id=origin.chat.id,
                 destination_label=(origin.chat.title or "Channel")[:60],
-                is_channel=True, anonymous=True, enabled=False,
+                message_thread_id=None, is_channel=True, anonymous=True, enabled=False,
             ), context.application, poll_id)
         except TelegramError:
             await update.effective_message.reply_text("Could not verify channel access. Check bot membership and administrator permissions.")
@@ -416,9 +440,13 @@ class PollBot:
             destination = chat_id if chat_id is not None else settings.chat_id
             if destination is None:
                 raise ValueError("Set the destination group first.")
+            topic_options = {}
+            if chat_id is None and settings.message_thread_id is not None:
+                topic_options["message_thread_id"] = settings.message_thread_id
             await context.bot.send_poll(
                 chat_id=destination, question=settings.render(), options=settings.options,
                 is_anonymous=settings.anonymous, allows_multiple_answers=settings.multiple,
+                **topic_options,
             )
 
     async def send_with_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, preview: bool = False, poll_id: int = 1) -> None:
