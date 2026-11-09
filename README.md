@@ -401,7 +401,10 @@ interval, regardless of weekdays. Changing back to `mon,thu 13:00` restores
 weekday scheduling.
 
 Answer options are entered one per line (2 to 10 options, each at most 100
-characters). Anonymous voting defaults to on, multiple answers to off.
+characters). New group polls default to non-anonymous voting (**Anonymous: Off**),
+so voters are visible. Multiple answers default to off. Channel polls are always
+anonymous, as required by Telegram. Existing saved polls keep their voting
+settings; use the **Anonymous** button to change an existing group poll.
 Polls stay open until stopped in Telegram; an automatic closing time is not
 implemented.
 

@@ -40,7 +40,7 @@ class Settings:
     minute: int = 0
     timezone: str = "UTC"
     chat_id: int | None = None
-    anonymous: bool = True
+    anonymous: bool = False
     multiple: bool = False
     enabled: bool = False
     interval_minutes: int | None = None

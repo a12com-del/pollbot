@@ -36,6 +36,17 @@ class SettingsTests(unittest.TestCase):
             SettingsStore(path).save(settings)
             self.assertEqual(SettingsStore(path).load(), settings)
 
+    def test_new_polls_default_to_nonanonymous_without_changing_saved_choices(self):
+        self.assertFalse(Settings().anonymous)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.db"
+            store = SettingsStore(path)
+            self.assertFalse(store.load().anonymous)
+            for anonymous in (True, False):
+                settings = replace(Settings(), anonymous=anonymous)
+                store.save(settings)
+                self.assertEqual(SettingsStore(path).load().anonymous, anonymous)
+
     def test_reject_invalid_settings(self):
         invalid = (
             {"timezone": "invalid"}, {"days": ()}, {"hour": 24},
@@ -62,7 +73,7 @@ class SettingsTests(unittest.TestCase):
     def test_legacy_single_poll_migrates_once_without_losing_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.db"
-            legacy = replace(Settings(), chat_id=-100123, enabled=True, cron_expression="0 12 * * 1,4")
+            legacy = replace(Settings(), chat_id=-100123, enabled=True, anonymous=True, cron_expression="0 12 * * 1,4")
             values = asdict(legacy)
             for field in ("name", "destination_label", "is_channel", "message_thread_id"):
                 values.pop(field)

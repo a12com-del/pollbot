@@ -100,6 +100,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         poll_id = context.user_data["poll_id"]
         self.assertEqual(len(self.bot.polls), 2)
         self.assertFalse(self.bot.polls[poll_id].enabled)
+        self.assertFalse(self.bot.polls[poll_id].anonymous)
         await self.bot.text(self.make_update(text="Evening class"), context)
         self.assertEqual(self.bot.store.load(poll_id).name, "Evening class")
         await self.bot.button(self.make_update(f"delete:{poll_id}"), context)
@@ -111,7 +112,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(poll_id, self.bot.polls)
 
     async def test_named_destinations_can_be_reused(self):
-        self.bot.settings = replace(Settings(), chat_id=-100123, destination_label="Main studio", is_channel=True)
+        self.bot.settings = replace(Settings(), chat_id=-100123, destination_label="Main studio", is_channel=True, anonymous=True)
         self.bot.store.save(self.bot.settings)
         second = self.add_poll(name="Evening", anonymous=False)
         context = self.make_context()
