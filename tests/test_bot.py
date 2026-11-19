@@ -3,13 +3,13 @@ import importlib.util
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from telegram import Chat
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 
 from config import Settings, SettingsStore
 
@@ -39,6 +39,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             user_data=user_data if user_data is not None else {}, application=SimpleNamespace(job_queue=queue),
             bot=SimpleNamespace(
                 send_poll=AsyncMock(), send_message=AsyncMock(),
+                pin_chat_message=AsyncMock(), unpin_chat_message=AsyncMock(),
                 get_chat=AsyncMock(return_value=Chat(-100789, "supergroup", title="Main studio")),
             ),
         )
@@ -48,6 +49,81 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         poll_id = self.bot.store.create(settings)
         self.bot.polls[poll_id] = settings
         return poll_id
+
+    async def test_published_poll_is_pinned_until_2355_on_its_local_date(self):
+        context = self.make_context()
+        self.bot.settings = replace(Settings(), chat_id=-100123, timezone="Asia/Tokyo", enabled=True)
+        await self.bot.button(self.make_update("pin_until_end_of_day:1"), context)
+        self.assertTrue(self.bot.store.load().pin_until_end_of_day)
+        self.assertTrue(self.bot.store.load().enabled)
+        context.bot.send_poll.return_value = SimpleNamespace(
+            date=datetime(2099, 1, 1, 15, 5, tzinfo=timezone.utc), message_id=42,
+        )
+        context.job = SimpleNamespace(data=1)
+        await self.bot.scheduled_poll(context)
+        context.bot.pin_chat_message.assert_awaited_once_with(chat_id=-100123, message_id=42, disable_notification=True)
+        deadline = datetime(2099, 1, 2, 14, 55, tzinfo=timezone.utc)
+        self.assertEqual(self.bot.store.list_unpins(), [(-100123, 42, deadline)])
+        context.application.job_queue.run_once.assert_called_once_with(
+            self.bot.unpin_poll, deadline, data=(-100123, 42), job_kwargs={"misfire_grace_time": None},
+        )
+
+    async def test_manual_send_pins_but_private_preview_and_late_poll_do_not(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, pin_until_end_of_day=True)
+        context = self.make_context()
+        sent = SimpleNamespace(date=datetime(2099, 1, 1, 23, 54, tzinfo=timezone.utc), message_id=42)
+        context.bot.send_poll.return_value = sent
+        await self.bot.send_with_feedback(self.make_update(), context, preview=True)
+        context.bot.pin_chat_message.assert_not_awaited()
+        sent.date = sent.date.replace(minute=55)
+        await self.bot.send_poll(context)
+        context.bot.pin_chat_message.assert_not_awaited()
+        self.assertEqual(self.bot.store.list_unpins(), [])
+        sent.date = sent.date.replace(minute=54)
+        await self.bot.send_with_feedback(self.make_update(), context)
+        context.bot.pin_chat_message.assert_awaited_once()
+
+    async def test_pin_failure_does_not_report_poll_as_unsent(self):
+        self.bot.settings = replace(Settings(), chat_id=-100123, pin_until_end_of_day=True, enabled=True)
+        context = self.make_context()
+        context.bot.send_poll.return_value = SimpleNamespace(
+            date=datetime(2099, 1, 1, tzinfo=timezone.utc), message_id=42,
+        )
+        for error in (Forbidden("No permission"), NetworkError("Disconnected")):
+            with self.subTest(error=type(error).__name__):
+                context.bot.pin_chat_message.side_effect = error
+                update = self.make_update()
+                await self.bot.send_with_feedback(update, context)
+                self.assertIn("poll was posted", update.effective_message.reply_text.call_args.args[0])
+                self.assertEqual(bool(self.bot.store.list_unpins()), isinstance(error, NetworkError))
+
+    async def test_overdue_unpin_is_restored_even_after_poll_is_deleted(self):
+        deadline = datetime.now(timezone.utc) - timedelta(days=1)
+        self.bot.store.save_unpin(-100123, 42, deadline)
+        self.bot.store.save_unpin(-100123, 43, datetime(2099, 1, 1, tzinfo=timezone.utc))
+        self.bot.store.delete(1)
+        restarted = module.PollBot(SettingsStore(self.bot.store.path), self.bot.admin_ids)
+        application = module.Application.builder().token("123:offline-test-token").build()
+        before = datetime.now(timezone.utc)
+        await restarted.startup(application)
+        jobs = {job.data: job for job in application.job_queue.jobs()}
+        self.assertGreaterEqual(jobs[(-100123, 42)].job.trigger.run_date, before)
+        self.assertEqual(jobs[(-100123, 43)].job.trigger.run_date.year, 2099)
+        context = self.make_context()
+        context.job = jobs[(-100123, 42)]
+        context.bot.unpin_chat_message.side_effect = [
+            NetworkError("Disconnected"), BadRequest("Message is not pinned"), True,
+        ]
+        await restarted.unpin_poll(context)
+        self.assertEqual(len(restarted.store.list_unpins()), 2)
+        self.assertEqual(context.application.job_queue.run_once.call_args.args[1], timedelta(minutes=5))
+        await restarted.unpin_poll(context)
+        context.bot.unpin_chat_message.assert_awaited_with(chat_id=-100123, message_id=42)
+        self.assertEqual([entry[1] for entry in restarted.store.list_unpins()], [43])
+        context.job = jobs[(-100123, 43)]
+        await restarted.unpin_poll(context)
+        context.bot.unpin_chat_message.assert_awaited_with(chat_id=-100123, message_id=43)
+        self.assertEqual(restarted.store.list_unpins(), [])
 
     async def test_saved_personal_defaults_create_independent_disabled_poll(self):
         source = replace(

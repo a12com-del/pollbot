@@ -7,13 +7,13 @@ import asyncio
 import logging
 import os
 from dataclasses import replace
-from datetime import time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
@@ -158,6 +158,7 @@ class PollBot:
             text += (
                 f"\nAnonymous: {'On' if settings.anonymous else 'Off'}"
                 f"\nMultiple answers: {'On' if settings.multiple else 'Off'}"
+                f"\nPin until 23:55: {'On' if settings.pin_until_end_of_day else 'Off'}"
             )
             return text, InlineKeyboardMarkup([
                 [InlineKeyboardButton("New poll", callback_data="new:0")],
@@ -171,6 +172,7 @@ class PollBot:
             [InlineKeyboardButton("Destination", callback_data="destination")],
             [InlineKeyboardButton(f"Anonymous: {'On' if settings.anonymous else 'Off'}", callback_data="anonymous")],
             [InlineKeyboardButton(f"Multiple answers: {'On' if settings.multiple else 'Off'}", callback_data="multiple")],
+            [InlineKeyboardButton(f"Pin until 23:55: {'On' if settings.pin_until_end_of_day else 'Off'}", callback_data="pin_until_end_of_day")],
             [InlineKeyboardButton("Disable" if settings.enabled else "Enable", callback_data="enabled"), InlineKeyboardButton("Preview", callback_data="preview")],
             [InlineKeyboardButton("Send now...", callback_data="sendnow")],
             [InlineKeyboardButton("Save as my defaults", callback_data="save_defaults")],
@@ -338,7 +340,7 @@ class PollBot:
             context.user_data["editing"] = action
             context.user_data["editing_poll_id"] = poll_id
             await update.effective_message.reply_text(PROMPTS[action] + "\n/cancel to cancel.")
-        elif action in {"anonymous", "multiple", "enabled"}:
+        elif action in {"anonymous", "multiple", "enabled", "pin_until_end_of_day"}:
             try:
                 self.save(replace(settings, **{action: not getattr(settings, action)}), context.application, poll_id)
             except ValueError as error:
@@ -474,13 +476,39 @@ class PollBot:
 
     async def startup(self, application: Application) -> None:
         self.reschedule(application)
+        for chat_id, message_id, deadline in self.store.list_unpins():
+            self.schedule_unpin(application, chat_id, message_id, deadline)
         LOGGER.info("Bot started with %s polls, %s enabled.", len(self.polls), sum(settings.enabled for settings in self.polls.values()))
 
-    async def send_poll(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int | None = None, poll_id: int = 1, scheduled: bool = False) -> None:
+    def schedule_unpin(self, application: Application, chat_id: int, message_id: int, when: datetime | timedelta) -> None:
+        queue = application.job_queue
+        if queue is None:
+            raise RuntimeError("Install python-telegram-bot with the job-queue extra.")
+        if isinstance(when, datetime):
+            when = max(when, datetime.now(timezone.utc))
+        queue.run_once(self.unpin_poll, when, data=(chat_id, message_id), job_kwargs={"misfire_grace_time": None})
+
+    async def unpin_poll(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id, message_id = context.job.data
+        try:
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError as error:
+            if not isinstance(error, BadRequest) or str(error).lower() not in {
+                "message to unpin not found", "message is not pinned", "message not found",
+            }:
+                LOGGER.warning("Poll unpin failed (%s); retrying.", type(error).__name__)
+                delay = error.retry_after if isinstance(error, RetryAfter) else 300
+                if not isinstance(delay, timedelta):
+                    delay = timedelta(seconds=delay)
+                self.schedule_unpin(context.application, chat_id, message_id, delay)
+                return
+        self.store.delete_unpin(chat_id, message_id)
+
+    async def send_poll(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int | None = None, poll_id: int = 1, scheduled: bool = False) -> str | None:
         async with self.send_lock:
             settings = self.polls.get(poll_id)
             if scheduled and (settings is None or not settings.enabled):
-                return
+                return None
             if settings is None:
                 raise ValueError("This poll no longer exists.")
             destination = chat_id if chat_id is not None else settings.chat_id
@@ -489,17 +517,35 @@ class PollBot:
             topic_options = {}
             if chat_id is None and settings.message_thread_id is not None:
                 topic_options["message_thread_id"] = settings.message_thread_id
-            await context.bot.send_poll(
+            message = await context.bot.send_poll(
                 chat_id=destination, question=settings.render(), options=settings.options,
                 is_anonymous=settings.anonymous, allows_multiple_answers=settings.multiple,
                 **topic_options,
             )
+            if chat_id is not None or not settings.pin_until_end_of_day:
+                return None
+            local = message.date.astimezone(ZoneInfo(settings.timezone))
+            deadline = local.replace(hour=23, minute=55, second=0, microsecond=0).astimezone(timezone.utc)
+            if deadline <= max(message.date, datetime.now(timezone.utc)):
+                return None
+            self.store.save_unpin(destination, message.message_id, deadline)
+            try:
+                await context.bot.pin_chat_message(chat_id=destination, message_id=message.message_id, disable_notification=True)
+            except TelegramError as error:
+                LOGGER.warning("Poll pin failed (%s).", type(error).__name__)
+                if isinstance(error, (BadRequest, Forbidden)):
+                    self.store.delete_unpin(destination, message.message_id)
+                else:
+                    self.schedule_unpin(context.application, destination, message.message_id, deadline)
+                return "The poll was posted, but pinning could not be confirmed. Check the bot's pinning permissions."
+            self.schedule_unpin(context.application, destination, message.message_id, deadline)
+            return None
 
     async def send_with_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, preview: bool = False, poll_id: int = 1) -> None:
         try:
-            await self.send_poll(context, update.effective_chat.id if preview else None, poll_id)
+            warning = await self.send_poll(context, update.effective_chat.id if preview else None, poll_id)
             if not preview:
-                await update.effective_message.reply_text("Poll sent.")
+                await update.effective_message.reply_text(warning or "Poll sent.")
         except (TelegramError, ValueError):
             await update.effective_message.reply_text(
                 "Poll was not confirmed. Check the group ID, bot membership and poll permissions. "
@@ -512,12 +558,14 @@ class PollBot:
         if settings is None or not settings.enabled:
             return
         try:
-            await self.send_poll(context, poll_id=poll_id, scheduled=True)
+            warning = await self.send_poll(context, poll_id=poll_id, scheduled=True)
         except (TelegramError, ValueError) as error:
             LOGGER.error("Scheduled poll %s failed (%s).", poll_id, type(error).__name__)
+            warning = "Delivery was not confirmed. Check its destination and bot permissions before retrying."
+        if warning:
             for admin_id in self.admin_ids:
                 try:
-                    await context.bot.send_message(admin_id, f"Poll '{settings.name}' was not confirmed. Check its destination and bot permissions before retrying.")
+                    await context.bot.send_message(admin_id, f"Poll '{settings.name}': {warning}")
                 except TelegramError:
                     LOGGER.warning("Could not notify admin %s.", admin_id)
 

@@ -49,6 +49,7 @@ class Settings:
     destination_label: str = ""
     is_channel: bool = False
     message_thread_id: int | None = None
+    pin_until_end_of_day: bool = False
 
     def validate(self) -> None:
         if self.message_thread_id is not None:
@@ -125,6 +126,7 @@ class SettingsStore:
             initialized = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'polls'").fetchone()
             connection.execute("CREATE TABLE IF NOT EXISTS polls (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS admin_defaults (admin_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS pending_unpins (chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, deadline TEXT NOT NULL, PRIMARY KEY (chat_id, message_id))")
             if initialized is None:
                 legacy = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").fetchone()
                 row = connection.execute("SELECT data FROM settings WHERE id = 1").fetchone() if legacy else None
@@ -187,3 +189,19 @@ class SettingsStore:
     def reset_defaults(self, admin_id: int) -> None:
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("DELETE FROM admin_defaults WHERE admin_id = ?", (admin_id,))
+
+    def save_unpin(self, chat_id: int, message_id: int, deadline: datetime) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO pending_unpins (chat_id, message_id, deadline) VALUES (?, ?, ?)",
+                (chat_id, message_id, deadline.isoformat()),
+            )
+
+    def list_unpins(self) -> list[tuple[int, int, datetime]]:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            rows = connection.execute("SELECT chat_id, message_id, deadline FROM pending_unpins").fetchall()
+        return [(chat_id, message_id, datetime.fromisoformat(deadline)) for chat_id, message_id, deadline in rows]
+
+    def delete_unpin(self, chat_id: int, message_id: int) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DELETE FROM pending_unpins WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))

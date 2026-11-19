@@ -315,7 +315,7 @@ Each allowlisted admin can save their own starting values for **New poll**:
 
 1. Select an existing poll in `/admin`, or create one to use as a template.
    Configure its question, answer options, schedule, time zone, destination,
-   topic, label, and voting preferences. Leave it disabled if it is only a template.
+   topic, label, voting, and pinning preferences. Leave it disabled if it is only a template.
 2. Press **Save as my defaults** in that poll's panel. This stores a snapshot
    for your Telegram user ID; it does not change the source poll or its schedule.
 3. Use **New poll** to create similar polls with those values already filled in.
@@ -434,6 +434,21 @@ anonymous, as required by Telegram. Existing saved polls keep their voting
 settings; use the **Anonymous** button to change an existing group poll.
 Polls stay open until stopped in Telegram; an automatic closing time is not
 implemented.
+
+### Pin Published Polls
+
+In `/admin`, select a poll and turn on **Pin until 23:55**. It is off by default.
+Scheduled polls and confirmed **Send now...** posts are pinned silently in their
+destination; private previews are never pinned. The bot unpins that exact message
+at 23:55 on its publication date in the poll's configured time zone. Polls posted
+at or after 23:55 are sent without pinning. Unpinning does not close the poll or
+remove any other pins.
+
+The bot needs administrator permission to **Pin messages** in a group or to
+**Edit messages** in a channel, in addition to its posting permissions. A poll
+can still be delivered if pinning fails; the bot reports the pin failure
+separately. Pending unpins persist in the database, even if the poll configuration
+changes or is deleted. After downtime, the bot attempts overdue unpins on startup.
 
 Question variables are evaluated at posting time in the configured time zone:
 
